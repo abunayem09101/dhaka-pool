@@ -1,0 +1,154 @@
+// =====================================================================
+// Dhaka Pool - Prisma schema
+//
+// This file is the single source of truth for the database structure.
+// It matches the ERD in README.md. Read top to bottom:
+//   User -> (Passenger role | Driver role)
+//   Driver -> Vehicle
+//   Vehicle -> Pool (an active "trip container" with a seat budget)
+//   Pool -> PoolMember -> RideRequest
+//   RideRequest -> RideStatusHistory (audit trail of every state change)
+// =====================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PASSENGER
+  DRIVER
+}
+
+enum RideStatus {
+  REQUESTED     // passenger asked for a ride, nothing matched yet
+  ACCEPTED      // a driver/pool has been matched (MATCHED == ACCEPTED)
+  DRIVER_ARRIVED
+  STARTED
+  COMPLETED
+  CANCELLED
+}
+
+enum PoolStatus {
+  OPEN        // still accepting more compatible passengers (has free seats)
+  FULL        // seats are full, no more passengers can join
+  DRIVER_ARRIVED
+  IN_PROGRESS // trip started
+  COMPLETED
+  CANCELLED
+}
+
+// A person who can sign in. role decides which app surface they use.
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role
+  createdAt    DateTime @default(now())
+
+  // a passenger's own ride requests
+  rideRequests RideRequest[]
+
+  // a driver's vehicle(s) - in this demo, one driver has one vehicle
+  vehicles Vehicle[]
+
+  @@map("users")
+}
+
+// A driver's car. capacity is the hard seat ceiling enforced by the
+// pooling engine (see services/matching.service.js).
+model Vehicle {
+  id        String   @id @default(uuid())
+  driverId  String
+  driver    User     @relation(fields: [driverId], references: [id])
+  name      String   // e.g. "Bullet"
+  model     String   // e.g. "Tesla"
+  capacity  Int      // total seats sellable, e.g. 3
+  isOnline  Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  pools Pool[]
+
+  @@map("vehicles")
+}
+
+// A Pool represents ONE physical trip being made by ONE vehicle. It may
+// carry multiple ride requests (passengers) at once, up to capacity.
+// occupiedSeats is updated inside a DB transaction with row locking so
+// two simultaneous join requests can never oversell the vehicle - see
+// services/matching.service.js::joinOrCreatePool for the mechanism.
+model Pool {
+  id            String     @id @default(uuid())
+  vehicleId     String
+  vehicle       Vehicle    @relation(fields: [vehicleId], references: [id])
+  status        PoolStatus @default(OPEN)
+  occupiedSeats Int        @default(0)
+
+  // the "anchor" pickup/destination zone this pool was opened for -
+  // later joiners must be compatible with this (see location.service.js)
+  pickupZone      String
+  destinationZone String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members PoolMember[]
+
+  @@map("pools")
+}
+
+// Join table: which ride requests are riding in which pool, and how
+// many seats + how much fare that specific passenger owes.
+model PoolMember {
+  id            String @id @default(uuid())
+  poolId        String
+  pool          Pool   @relation(fields: [poolId], references: [id])
+  rideRequestId String @unique
+  rideRequest   RideRequest @relation(fields: [rideRequestId], references: [id])
+  seats         Int
+  farePaisa     Int
+
+  createdAt DateTime @default(now())
+
+  @@map("pool_members")
+}
+
+// One passenger's ask for a ride. This is the row whose `status` drives
+// the lifecycle state machine (see utils/stateMachine.js).
+model RideRequest {
+  id              String     @id @default(uuid())
+  passengerId     String
+  passenger       User       @relation(fields: [passengerId], references: [id])
+  pickupZone      String
+  destinationZone String
+  seatsRequested  Int
+  estimatedFarePaisa Int
+  status          RideStatus @default(REQUESTED)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  poolMember    PoolMember?
+  statusHistory RideStatusHistory[]
+
+  @@map("ride_requests")
+}
+
+// Append-only audit trail. Every transition writes one row here, which
+// is what makes the state machine provable/inspectable during a demo.
+model RideStatusHistory {
+  id            String     @id @default(uuid())
+  rideRequestId String
+  rideRequest   RideRequest @relation(fields: [rideRequestId], references: [id])
+  fromStatus    RideStatus?
+  toStatus      RideStatus
+  changedAt     DateTime   @default(now())
+  note          String?
+
+  @@map("ride_status_history")
+}
