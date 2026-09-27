@@ -31,6 +31,8 @@ export default function RequestRidePage() {
   const [pickupZone, setPickupZone] = useState('');
   const [destinationZone, setDestinationZone] = useState('');
   const [seats, setSeats] = useState(1);
+  const [paymentMethod, setPaymentMethod] = useState('CASH');
+  const [wallet, setWallet] = useState(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
 
@@ -39,6 +41,7 @@ export default function RequestRidePage() {
     if (!u || u.role !== 'PASSENGER') return router.replace('/login');
     setUser(u);
     api('/api/locations').then(setZones).catch((err) => setError(err.message));
+    api('/api/me').then((me) => setWallet(me.walletBalancePaisa)).catch(() => {});
   }, [router]);
 
   async function submit(e) {
@@ -52,7 +55,7 @@ export default function RequestRidePage() {
     try {
       const ride = await api('/api/rides', {
         method: 'POST',
-        body: { pickupZone, destinationZone, seatsRequested: Number(seats) },
+        body: { pickupZone, destinationZone, seatsRequested: Number(seats), paymentMethod },
       });
       router.push(`/passenger/rides/${ride.id}`);
     } catch (err) {
@@ -91,6 +94,14 @@ export default function RequestRidePage() {
             <option value={1}>1</option>
             <option value={2}>2</option>
             <option value={3}>3</option>
+          </select>
+        </div>
+
+        <div className="field">
+          <label>Payment method</label>
+          <select value={paymentMethod} onChange={(e) => setPaymentMethod(e.target.value)}>
+            <option value="CASH">Cash (pay driver directly)</option>
+            <option value="TESLAPAY">TeslaPay wallet{wallet !== null ? ` — balance ৳${(wallet / 100).toFixed(2)}` : ''}</option>
           </select>
         </div>
 

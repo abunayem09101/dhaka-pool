@@ -51,6 +51,14 @@ Build a simplified ride-pooling platform where:
 - Hard seat-capacity enforcement, protected against race conditions
 - Integer-paisa fare calculation with a per-seat pooling discount
 
+**Payment (simulated)**
+- Passenger picks **Cash** or a simulated **TeslaPay wallet** when
+  requesting a ride
+- Every demo passenger starts with a wallet balance (seeded)
+- On trip completion: Cash is marked `PAID` immediately; TeslaPay
+  deducts the fare from the wallet, or marks the payment `FAILED` if
+  the balance is too low (the ride still completes — see §16)
+
 ## 4. Screenshots
 
 This is a code deliverable without a hosted deployment (see
@@ -105,6 +113,7 @@ erDiagram
         string email
         string passwordHash
         enum role
+        int walletBalancePaisa "simulated TeslaPay balance"
     }
     VEHICLES {
         string id PK
@@ -137,6 +146,8 @@ erDiagram
         int seatsRequested
         int estimatedFarePaisa
         enum status
+        enum paymentMethod "CASH or TESLAPAY"
+        enum paymentStatus "PENDING, PAID, or FAILED"
     }
     RIDE_STATUS_HISTORY {
         string id PK
@@ -147,7 +158,7 @@ erDiagram
     }
 ```
 
-## 7. Tech stack
+## 7. Tech stack & justification
 
 | Layer      | Choice                                   |
 |------------|-------------------------------------------|
@@ -159,6 +170,75 @@ erDiagram
 | Testing    | Jest + Supertest                           |
 | Container  | Docker, Docker Compose                     |
 
+For every choice that wasn't mandated by the assignment (only "Node.js
+backend" and "React or Next.js frontend" were required), here's what it
+was picked over, why it fits an MVP of this specific size, and what
+would make me switch:
+
+- **Express, not NestJS/Fastify.** Alternatives considered: NestJS
+  (more structure, DI, decorators) and Fastify (faster raw throughput).
+  Express fits here because the whole API is ~7 route files and the
+  business logic that actually matters (pooling, state machine, fare)
+  is already isolated into plain `services/` modules — NestJS's
+  module/DI ceremony would add boilerplate without adding safety at
+  this scale. **I'd switch to NestJS** if the API grew past a handful
+  of domains with real cross-cutting concerns (multiple guards,
+  interceptors, background jobs) where its structure starts paying for
+  itself instead of just adding files.
+
+- **PostgreSQL, not MySQL or SQLite.** The pooling/capacity problem is
+  fundamentally about **transactional row locking**
+  (`SELECT ... FOR UPDATE`) and enum types, both of which Postgres
+  supports cleanly and predictably; MySQL's locking semantics under
+  `READ COMMITTED` are more subtly different across
+  storage engines, which is exactly the kind of subtlety I don't want
+  in the one piece of this system where correctness matters most.
+  SQLite was never seriously in the running — it has no real
+  concurrent-writer story, which is disqualifying for the concurrency
+  requirement itself. **I'd switch** only if the deployment target
+  forced a managed MySQL and there were time to re-verify the locking
+  behavior under load.
+
+- **Prisma, not a raw query builder (Knex) or a heavier ORM (TypeORM,
+  Sequelize).** Prisma gives typed models and migrations for the 90% of
+  queries that are simple CRUD, while still allowing raw SQL
+  (`$queryRaw`, `$transaction`) for the 10% that need precise control —
+  which is exactly what the seat-locking transaction needs. TypeORM's
+  Active Record pattern tends to blur where business logic lives;
+  Knex would mean hand-writing every query with no type safety at all,
+  which isn't worth it for a schema this size. **I'd switch to Knex or
+  raw SQL** if the query patterns became too dynamic/reporting-heavy
+  for Prisma's query API to express comfortably.
+
+- **JWT (stateless), not sessions.** A session store would mean either
+  a sticky session or a shared session store (e.g. Redis) the moment
+  there's more than one API instance — extra infrastructure the brief
+  explicitly says not to introduce without a reason (§9 "do not
+  introduce ... Redis ... just to look advanced"). A stateless JWT
+  needs nothing extra to run two API replicas behind a load balancer.
+  The trade-off is documented honestly in §18: a 12h JWT can't be
+  revoked early. **I'd switch to short-lived access + refresh tokens**
+  (see §19) the moment this needed real production security, not just
+  an MVP demo.
+
+- **Jest + Supertest, not Mocha/Chai or Vitest.** Jest bundles the
+  runner, assertions, and mocking in one dependency with zero config
+  for a plain Node project, and Supertest is the standard way to
+  exercise Express routes without actually binding a port. Vitest is
+  primarily aimed at Vite-based frontend projects; there's no Vite
+  here, so it buys nothing. **I'd switch to Vitest** if the frontend
+  test suite grew large enough to want one consistent runner across
+  both frontend and backend.
+
+- **Docker Compose, not a cloud-hosted DB/managed platform.** The
+  assignment requires `docker compose up` to work and forbids paid
+  infrastructure (§16). Compose is also simply the right tool for "three
+  services that need to start together and talk to each other" at this
+  scale — no orchestration platform is justified for three containers.
+  **I'd switch to Kubernetes/ECS** only at real multi-instance,
+  multi-environment scale, once there were actually multiple services
+  and environments to coordinate.
+
 ## 8. Project structure
 
 ```
@@ -169,13 +249,15 @@ dhaka-pool/
 │   ├── prisma/
 │   │   ├── schema.prisma
 │   │   ├── seed.js
-│   │   └── migrations/20260101000000_init/migration.sql
+│   │   └── migrations/
+│   │       ├── 20260101000000_init/migration.sql
+│   │       └── 20260115000000_add_payments/migration.sql
 │   ├── src/
 │   │   ├── app.js, index.js
 │   │   ├── db/prisma.js
 │   │   ├── middleware/ (auth.js, errorHandler.js)
 │   │   ├── routes/ (auth, ride, driver)
-│   │   ├── services/ (location, fare, matching)
+│   │   ├── services/ (location, fare, matching, payment)
 │   │   └── utils/stateMachine.js
 │   ├── tests/ (fare, state, matching, pool, ownership, cancellation)
 │   └── Dockerfile
@@ -215,7 +297,17 @@ docker compose up --build
 - Postgres: localhost:5432 (user/pass: `postgres`/`postgres`, db: `dhaka_pool`)
 
 The API container automatically runs `prisma migrate deploy` and the
-seed script on every boot before starting the server.
+seed script on every boot before starting the server. All three
+services (`postgres`, `api`, `frontend`) have Docker healthchecks;
+`api` waits for Postgres to report healthy, and `frontend` waits for
+`api` to report healthy, so `docker compose up` won't race a service
+against a dependency that isn't ready yet.
+
+The backend image is built on `node:20-slim` (Debian) rather than
+`node:20-alpine`, with `openssl` installed explicitly — this was a real
+fix made during development after Alpine's musl libc caused Prisma's
+query engine to fail at runtime with an opaque
+`Could not parse schema engine response` error (see §20 AI Usage).
 
 ## 12. Database migration
 
@@ -240,26 +332,35 @@ npm run seed
 ```
 
 This creates Jashim (driver, Tesla Bullet, capacity 3) and passengers
-Nusrat, Rafiq, and Shirin. Safe to re-run (upserts by email).
+Nusrat, Rafiq, and Shirin, each with a simulated TeslaPay wallet balance
+(see §14 for the exact amounts — Shirin's is deliberately low, to make
+the "insufficient balance" edge case demoable). Safe to re-run (upserts
+by email).
 
 ## 14. Demo credentials
 
 All demo accounts share the password `password123`.
 
-| Name | Email | Role |
-|---|---|---|
-| Jashim | jashim@dhakapool.demo | Driver (Tesla Bullet, 3 seats) |
-| Nusrat | nusrat@dhakapool.demo | Passenger |
-| Rafiq | rafiq@dhakapool.demo | Passenger |
-| Shirin | shirin@dhakapool.demo | Passenger |
+| Name | Email | Role | TeslaPay wallet |
+|---|---|---|---|
+| Jashim | jashim@dhakapool.demo | Driver (Tesla Bullet, 3 seats) | — |
+| Nusrat | nusrat@dhakapool.demo | Passenger | ৳500.00 |
+| Rafiq | rafiq@dhakapool.demo | Passenger | ৳500.00 |
+| Shirin | shirin@dhakapool.demo | Passenger | ৳5.00 (intentionally low) |
 
 **Suggested demo flow:** sign in as Jashim → go online. In another
 browser/incognito window sign in as Nusrat → request Banani → Mohakhali
-(1 seat). Sign in as Rafiq → request Banani → Gulshan 1 (1 seat).
-Back on Jashim's screen, accept both from "Ride requests" — they land
-in the same pool. Try a third passenger requesting a totally different
-route (e.g. Mirpur → Uttara) to see a *second*, independent pool open
-on the same vehicle.
+(1 seat, pay by Cash or TeslaPay). Sign in as Rafiq → request Banani →
+Gulshan 1 (1 seat). Back on Jashim's screen, accept both from "Ride
+requests" — they land in the same pool. Try a third passenger
+requesting a totally different route (e.g. Mirpur → Uttara) to see a
+*second*, independent pool open on the same vehicle.
+
+**Payment edge case:** sign in as Shirin, request any ride, and choose
+**TeslaPay** as the payment method. Her wallet only has ৳5.00, which is
+less than any fare, so once the driver completes the trip her ride's
+`paymentStatus` will show `FAILED` instead of `PAID` — a live example
+of the "payment doesn't block trip completion" decision in §16.
 
 ## 15. API overview
 
@@ -270,8 +371,9 @@ All endpoints except `/health` and `/api/auth/*` require
 |---|---|---|---|
 | POST | `/api/auth/signup` | — | Create an account |
 | POST | `/api/auth/signin` | — | Log in |
+| GET | `/api/me` | any | Current user's profile + wallet balance |
 | GET | `/api/locations` | any | List predefined zones |
-| POST | `/api/rides` | passenger | Request a ride |
+| POST | `/api/rides` | passenger | Request a ride (pickup, destination, seats, paymentMethod) |
 | GET | `/api/rides/mine` | passenger | Own ride history |
 | GET | `/api/rides/:id` | owner | Ride detail + status history |
 | POST | `/api/rides/:id/cancel` | owner | Cancel (if in a cancellable state) |
@@ -317,6 +419,21 @@ All endpoints except `/health` and `/api/auth/*` require
 - **Driver actions apply to the whole pool.** Since multiple passengers
   can share one physical trip, "driver arrived / start / complete" move
   every ride request in the pool together, in one DB transaction.
+- **Payment never blocks trip completion.** By the time a trip reaches
+  `COMPLETED`, the driver has already physically driven it — refusing
+  to complete the ride because a wallet charge failed would strand the
+  driver over a billing problem, not a trip problem. So `settlePayment`
+  runs inside the same transaction as the status change, but a failed
+  TeslaPay debit just marks that ride's `paymentStatus` as `FAILED`
+  rather than rolling back the trip. This is a genuine assumption
+  (§17 of the brief) I'm making explicit: in a real system this would
+  instead create a collections/dunning workflow, not a UI-visible
+  "FAILED" badge.
+- **Wallet balance lives on `User`, not a separate `Wallet` table.**
+  Only passengers ever have a meaningful balance in this demo, and
+  there's exactly one wallet per user — a separate table would be
+  correct at a larger scope (e.g. supporting top-ups, transaction
+  history, multiple currencies) but is unjustified complexity here.
 
 ## 17. Trade-offs
 
@@ -334,8 +451,10 @@ All endpoints except `/health` and `/api/auth/*` require
 
 ## 18. Known limitations
 
-- No payment integration — fares are calculated and displayed but
-  never actually charged.
+- Payment is simulated only — Cash is auto-marked `PAID`, and TeslaPay
+  is a fake in-database wallet balance, not a real payment gateway.
+  There's no top-up flow, no transaction ledger beyond the ride record
+  itself, and no refunds on cancellation.
 - No password reset / email verification flow.
 - A ride cannot be cancelled once `STARTED` (only before) — there's no
   "aborted mid-trip" concept in this model.
@@ -358,7 +477,10 @@ All endpoints except `/health` and `/api/auth/*` require
 - Real map/routing integration (e.g. OpenRouteService) instead of
   fixed zones.
 - Websocket-based live status instead of polling.
-- Ratings, in-app chat, and payments.
+- Ratings, in-app chat, and a real payment gateway (Stripe/bKash/Nagad)
+  in place of the simulated Cash/TeslaPay wallet.
+- A wallet top-up flow and a transaction ledger, instead of a single
+  balance column with no history.
 - Support multiple vehicles per driver and a dispatcher view across
   all online drivers.
 - Replace the 12-hour JWT with short-lived access tokens + refresh
@@ -366,17 +488,50 @@ All endpoints except `/health` and `/api/auth/*` require
 
 ## 20. AI usage
 
-This project (backend, frontend, tests, Docker setup, and this README)
-was built with Claude (Anthropic) as a pair-programmer, based on a
-Bengali-language assignment brief describing the required features,
-pooling rule, fare formula, lifecycle, concurrency requirement, test
-list, Docker/Git/README expectations, and ERD. All code was written
-directly into the repository and the pure-logic unit tests (fare,
-state machine, zone matching — 14 tests) were actually executed and
-verified passing during development; see §18 for the one environment
-limitation encountered (DB-dependent tests needing live Postgres +
-network access to Prisma's engine binaries, unavailable in the
-authoring sandbox).
+**Tools used:** Claude (Anthropic), used as a pair-programmer for the
+entire codebase — backend, frontend, tests, Docker setup, git history,
+and this README — starting from a Bengali-language assignment brief
+describing the required features, pooling rule, fare formula,
+lifecycle, concurrency requirement, test list, and Docker/Git/README
+expectations. What Claude used it for, specifically: designing the
+Prisma schema/ERD from the brief's described entities, writing the
+concurrency-safe seat allocation, drafting the frontend pages, and
+structuring the git history into the required branch model.
+
+**One accepted suggestion:** Claude's approach to the concurrency
+problem (§14 of the brief — Nusrat and Shirin both claiming the last
+seat) was to wrap the capacity check and the seat-count write in a
+single Prisma interactive transaction, taking a `SELECT ... FOR UPDATE`
+row lock on the vehicle before re-reading the current occupied-seat
+count. I accepted this as-is: it's the standard, well-understood
+pattern for "read-check-write" races in Postgres, it needs no extra
+infrastructure (no Redis lock, no queue), and it's something I can
+fully explain and defend — the lock forces the second transaction to
+wait and then see fresh data, rather than both transactions succeeding
+off of the same stale seat count.
+
+**One rejected/changed suggestion:** the first backend `Dockerfile`
+Claude produced used `node:20-alpine` as the base image. When actually
+run (not just written), the API container crashed in a loop with
+`Error: Could not parse schema engine response: SyntaxError:
+Unexpected token 'E', "Error load"... is not valid JSON` — Prisma's
+query engine couldn't find a compatible OpenSSL on Alpine's musl libc,
+and it was printing a plain-text error where Prisma expected JSON. I
+rejected the alpine-based image and had it changed to `node:20-slim`
+(Debian) with `openssl` installed explicitly via `apt-get`, which
+resolved it. This is a known Prisma/Alpine interoperability issue, but
+it only surfaced by actually building and running the container rather
+than trusting that "the Dockerfile looks right" — which is exactly why
+Claude's own code was tested against a real Docker build rather than
+taken on faith.
+
+The pure-logic unit tests (fare calculation, the state machine, and
+zone matching — 14 tests total) were actually executed and verified
+passing during development. See §18 for the one environment limitation
+encountered while developing this (the three DB-dependent test files
+needing live Postgres + network access to Prisma's engine binaries,
+which the authoring sandbox didn't have — they're written and will run
+under `docker compose` / any normal dev machine).
 
 ## 21. Deployment URL
 

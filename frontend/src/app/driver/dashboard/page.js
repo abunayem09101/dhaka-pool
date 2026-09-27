@@ -107,7 +107,11 @@ export default function DriverDashboard() {
           <p className="muted">{pool.pickupZone.replace('_', ' ')} → {pool.destinationZone.replace('_', ' ')}</p>
 
           {pool.members.map((m) => (
-            <p key={m.id}>👤 {m.rideRequest.passenger.name} — {m.seats} seat(s), ৳{(m.farePaisa / 100).toFixed(2)}</p>
+            <p key={m.id}>
+              👤 {m.rideRequest.passenger.name} — {m.seats} seat(s), ৳{(m.farePaisa / 100).toFixed(2)}
+              {' '}({m.rideRequest.paymentMethod === 'TESLAPAY' ? 'TeslaPay' : 'Cash'}
+              {m.rideRequest.paymentStatus !== 'PENDING' ? `, ${m.rideRequest.paymentStatus}` : ''})
+            </p>
           ))}
 
           {NEXT_ACTION[pool.status] && (
