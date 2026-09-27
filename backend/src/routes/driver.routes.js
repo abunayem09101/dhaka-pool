@@ -4,6 +4,7 @@ const { requireAuth, requireRole } = require('../middleware/auth');
 const { assertTransitionAllowed } = require('../utils/stateMachine');
 const { isPoolCompatible } = require('../services/location.service');
 const { joinOrCreatePool, SeatUnavailableError } = require('../services/matching.service');
+const { settlePayment } = require('../services/payment.service');
 
 const router = express.Router();
 router.use(requireAuth, requireRole('DRIVER'));
@@ -147,17 +148,27 @@ async function transitionPool({ driverId, poolId, toRideStatus, toPoolStatus, no
     assertTransitionAllowed(member.rideRequest.status, toRideStatus);
   }
 
-  await prisma.$transaction([
-    ...pool.members.map((m) =>
-      prisma.rideRequest.update({ where: { id: m.rideRequestId }, data: { status: toRideStatus } })
-    ),
-    ...pool.members.map((m) =>
-      prisma.rideStatusHistory.create({
+  // Interactive transaction (not the array form) because reaching
+  // COMPLETED also needs to settle payment per member using the same
+  // `tx` client - wallet debit and status change must be atomic.
+  await prisma.$transaction(async (tx) => {
+    for (const m of pool.members) {
+      await tx.rideRequest.update({ where: { id: m.rideRequestId }, data: { status: toRideStatus } });
+      await tx.rideStatusHistory.create({
         data: { rideRequestId: m.rideRequestId, fromStatus: m.rideRequest.status, toStatus: toRideStatus, note },
-      })
-    ),
-    prisma.pool.update({ where: { id: pool.id }, data: { status: toPoolStatus } }),
-  ]);
+      });
+
+      if (toRideStatus === 'COMPLETED') {
+        await settlePayment(tx, {
+          rideRequestId: m.rideRequestId,
+          passengerId: m.rideRequest.passengerId,
+          method: m.rideRequest.paymentMethod,
+          farePaisa: m.farePaisa,
+        });
+      }
+    }
+    await tx.pool.update({ where: { id: pool.id }, data: { status: toPoolStatus } });
+  });
 
   return prisma.pool.findUnique({
     where: { id: pool.id },
