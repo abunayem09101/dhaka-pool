@@ -62,6 +62,13 @@ export default function PassengerRideDetail() {
           <StatusBadge status={ride.status} />
         </div>
         <p className="muted">{ride.seatsRequested} seat(s) · Fare: ৳{(ride.estimatedFarePaisa / 100).toFixed(2)}</p>
+        <p className="muted">
+          Payment: {ride.paymentMethod === 'TESLAPAY' ? 'TeslaPay wallet' : 'Cash'} —{' '}
+          <span className={`badge ${ride.paymentStatus === 'FAILED' ? 'CANCELLED' : ride.paymentStatus === 'PAID' ? 'COMPLETED' : 'REQUESTED'}`}>
+            {ride.paymentStatus}
+          </span>
+          {ride.paymentStatus === 'FAILED' && ' — insufficient wallet balance, please pay the driver in cash'}
+        </p>
 
         {driver && (
           <p>Driver: <strong>{driver.name}</strong> — {ride.poolMember.pool.vehicle.model} {ride.poolMember.pool.vehicle.name}</p>

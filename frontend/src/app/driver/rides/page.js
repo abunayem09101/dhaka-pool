@@ -41,7 +41,10 @@ export default function DriverHistoryPage() {
             <StatusBadge status={p.status} />
           </div>
           {p.members.map((m) => (
-            <p key={m.id} className="muted">👤 {m.rideRequest.passenger.name} — {m.seats} seat(s), ৳{(m.farePaisa / 100).toFixed(2)}</p>
+            <p key={m.id} className="muted">
+              👤 {m.rideRequest.passenger.name} — {m.seats} seat(s), ৳{(m.farePaisa / 100).toFixed(2)}
+              {' '}({m.rideRequest.paymentMethod === 'TESLAPAY' ? 'TeslaPay' : 'Cash'}, {m.rideRequest.paymentStatus})
+            </p>
           ))}
         </div>
       ))}

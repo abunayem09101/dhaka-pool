@@ -8,6 +8,19 @@ const { releaseSeats } = require('../services/matching.service');
 
 const router = express.Router();
 
+// Current user's own profile, including simulated TeslaPay wallet balance.
+router.get('/me', requireAuth, async (req, res, next) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { id: true, name: true, email: true, role: true, walletBalancePaisa: true },
+    });
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Public-ish (still requires login) list of predefined zones for the
 // pickup/destination dropdowns on the frontend.
 router.get('/locations', requireAuth, (req, res) => {
@@ -19,7 +32,7 @@ router.get('/locations', requireAuth, (req, res) => {
 // --- Create a ride request (passenger only) -------------------------
 router.post('/rides', requireAuth, requireRole('PASSENGER'), async (req, res, next) => {
   try {
-    const { pickupZone, destinationZone, seatsRequested } = req.body;
+    const { pickupZone, destinationZone, seatsRequested, paymentMethod = 'CASH' } = req.body;
     const seats = Number(seatsRequested);
 
     if (!isValidZone(pickupZone) || !isValidZone(destinationZone)) {
@@ -30,6 +43,9 @@ router.post('/rides', requireAuth, requireRole('PASSENGER'), async (req, res, ne
     }
     if (!Number.isInteger(seats) || seats < 1 || seats > 3) {
       return res.status(400).json({ error: 'seatsRequested must be an integer between 1 and 3' });
+    }
+    if (!['CASH', 'TESLAPAY'].includes(paymentMethod)) {
+      return res.status(400).json({ error: 'paymentMethod must be CASH or TESLAPAY' });
     }
 
     // Estimate assumes no pooling yet (worst case for the passenger);
@@ -45,6 +61,7 @@ router.post('/rides', requireAuth, requireRole('PASSENGER'), async (req, res, ne
         seatsRequested: seats,
         estimatedFarePaisa,
         status: 'REQUESTED',
+        paymentMethod,
       },
     });
 
