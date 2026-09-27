@@ -42,6 +42,19 @@ enum PoolStatus {
   CANCELLED
 }
 
+// Simulated payment - no real payment gateway, per the assignment's
+// "Cash or simulated TeslaPay wallet" requirement.
+enum PaymentMethod {
+  CASH      // assumed handed to the driver in person, marked PAID immediately
+  TESLAPAY  // deducted from the passenger's in-app wallet balance on completion
+}
+
+enum PaymentStatus {
+  PENDING // ride not completed yet, nothing charged
+  PAID
+  FAILED  // TeslaPay wallet had insufficient balance at completion time
+}
+
 // A person who can sign in. role decides which app surface they use.
 model User {
   id           String   @id @default(uuid())
@@ -50,6 +63,11 @@ model User {
   passwordHash String
   role         Role
   createdAt    DateTime @default(now())
+
+  // Simulated TeslaPay wallet balance, in integer paisa. Only meaningful
+  // for passengers, but kept on User rather than a separate table since
+  // this demo has no other payer type - see README "Payment simulation".
+  walletBalancePaisa Int @default(10000) // ৳100.00 starting balance
 
   // a passenger's own ride requests
   rideRequests RideRequest[]
@@ -129,6 +147,10 @@ model RideRequest {
   seatsRequested  Int
   estimatedFarePaisa Int
   status          RideStatus @default(REQUESTED)
+
+  paymentMethod PaymentMethod  @default(CASH)
+  paymentStatus PaymentStatus  @default(PENDING)
+  paidAt        DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
